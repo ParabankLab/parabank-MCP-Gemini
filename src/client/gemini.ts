@@ -3,12 +3,8 @@ import { GoogleGenAI } from '@google/genai';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
-// 1. Initialize GoogleGenAI SDK with environment variable
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-/**
- * Helper: Converts MCP Tool definitions to Gemini's expected FunctionDeclaration format
- */
 function convertMcpToolsToGemini(mcpTools: any[]) {
     return mcpTools.map((tool) => ({
         name: tool.name,
@@ -20,10 +16,9 @@ function convertMcpToolsToGemini(mcpTools: any[]) {
 async function runAgent(userPrompt: string) {
     console.log(`\n🤖 User Prompt: "${userPrompt}"\n`);
 
-    // 2. Connect to your compiled MCP server process via stdio
     const transport = new StdioClientTransport({
         command: 'node',
-        args: ['./dist/index.js'], // Ensure this path points to your built MCP server file
+        args: ['./dist/index.js'],
     });
 
     const mcpClient = new Client(
@@ -35,14 +30,14 @@ async function runAgent(userPrompt: string) {
         await mcpClient.connect(transport);
         console.log('✅ Connected to MCP Server');
 
-        // 3. Discover available tools from the MCP server
         const mcpToolsResponse = await mcpClient.listTools();
         const functionDeclarations = convertMcpToolsToGemini(mcpToolsResponse.tools);
         console.log(`🛠️ Loaded ${functionDeclarations.length} MCP tool(s) for Gemini.`);
 
-        // 4. Send request to Gemini Flash with function declarations registered
         const model = 'gemini-3.6-flash';
-        const response = await ai.models.generateContent({
+
+        // 1. Initial Prompt
+        const initialResponse = await ai.models.generateContent({
             model,
             contents: userPrompt,
             config: {
@@ -50,36 +45,76 @@ async function runAgent(userPrompt: string) {
             },
         });
 
-        // 5. Inspect if Gemini decided to invoke a function
-        const functionCalls = response.functionCalls;
+        const functionCalls = initialResponse.functionCalls;
 
         if (functionCalls && functionCalls.length > 0) {
-            for (const call of functionCalls) {
-                console.log(`\n⚡ Gemini requested tool call: [${call.name}]`);
-                console.log(`📦 Arguments:`, JSON.stringify(call.args, null, 2));
+            console.log(`\n⚡ Gemini requested ${functionCalls.length} tool call(s).`);
 
-                // 6. Execute tool via MCP client
+            const functionResponseParts: any[] = [];
+
+            // 2. Execute all requested tool calls
+            for (const call of functionCalls) {
+                console.log(`\n▶️ Executing [${call.name}] with args:`, JSON.stringify(call.args, null, 2));
+
                 const executionResult = await mcpClient.callTool({
                     name: call.name ?? '',
                     arguments: (call.args as Record<string, any>) || {},
                 });
 
-                console.log(`\n🎯 MCP Tool Execution Output:`);
-                console.log(JSON.stringify(executionResult, null, 2));
+                // Parse text content string back into JSON if applicable so Gemini gets structured data
+                let parsedOutput: any = executionResult.content;
+                if (
+                    Array.isArray(executionResult.content) &&
+                    executionResult.content[0]?.type === 'text'
+                ) {
+                    try {
+                        parsedOutput = JSON.parse(executionResult.content[0].text);
+                    } catch {
+                        parsedOutput = executionResult.content[0].text;
+                    }
+                }
+
+                functionResponseParts.push({
+                    functionResponse: {
+                        name: call.name,
+                        response: { output: parsedOutput },
+                    },
+                });
+            }
+
+            // 3. Extract pure candidate parts array
+            const modelParts = initialResponse.candidates?.[0]?.content?.parts || [];
+
+            // 4. Send follow-up request with role 'function' or explicitly structured turns
+            const followUpResponse = await ai.models.generateContent({
+                model,
+                contents: [
+                    { role: 'user', parts: [{ text: userPrompt }] },
+                    { role: 'model', parts: modelParts },
+                    { role: 'user', parts: functionResponseParts },
+                ],
+            });
+
+            const finalCandidate = followUpResponse.candidates?.[0];
+            const textPart = finalCandidate?.content?.parts?.find((p: any) => p.text);
+
+            if (textPart?.text) {
+                console.log(`\n💬 Gemini Final Response:\n${textPart.text}`);
+            } else if (followUpResponse.text) {
+                console.log(`\n💬 Gemini Final Response:\n${followUpResponse.text}`);
+            } else {
+                console.log(`\n💬 Raw Response Structure:\n`, JSON.stringify(finalCandidate, null, 2));
             }
         } else {
-            // Direct text response if no tool call was triggered
-            console.log(`\n💬 Gemini Response:\n${response.text}`);
+            console.log(`\n💬 Gemini Response:\n${initialResponse.text}`);
         }
     } catch (error) {
         console.error('❌ Error during execution:', error);
     } finally {
-        // 7. Clean up connection
         await transport.close();
         console.log('\n🔒 MCP Server Connection Closed');
     }
 }
 
-// Quick Execution Test
-const prompt = process.argv[2] || 'Run the e2e test suite and get consumer metrics.';
+const prompt = process.argv[2] || 'What is the balance for account 13122?';
 runAgent(prompt);
